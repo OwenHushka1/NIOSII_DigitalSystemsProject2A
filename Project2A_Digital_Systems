@@ -1,0 +1,227 @@
+.section .reset, "ax"
+.global _start 
+.equ O_UART_DATA,     0x1000  #offset for the UART's data register
+.equ O_UART_CTRL,     0x1004 #offset for UART's control register
+.equ O_7SEG_LO,       0x20 #offsets for the 7 segment display 
+.equ O_7SEG_HI,       0x30
+
+
+##### Macros ########
+.macro rori dst, src, i
+    roli    \dst, \src, (32 - \i)  #right rotate macro
+.endm
+
+_start:
+    movia sp, 0x1000  #starting stack pointer
+    movia gp, 0xff200000 #base address of the DE10Lite 
+    br main
+
+.section .exceptions, "ax"
+    rdctl et, ipending  #check present pending IRQs
+    bne et, r0, HardwareInterrupt
+    eret  #Non-interrupt exceptions are ignored
+
+HardwareInterrupt: 
+    subi ea, ea, 4 #rewind ea to restart abort 
+
+    subi sp, sp, 8  #save all registers used by the IRQ handlers
+    stw r2, 0(sp)
+    stw r3, 4(sp)
+    andi r2, et, 0b10  #check if irq number 1
+    beq r2, r0, NotIRQ1
+    
+########handle pushbutton isr for irq#1
+
+    ldwio r3, 0x5c(gp)  #Read EdgeCapture register
+    stwio r3, 0x5c(gp)  #Reset EdgeCapture bits: Deassert IRQ1
+
+    #make {1, 2} into {-1, +1}
+    slli r3, r3, 1 #{2, 4}
+    subi r3, r3, 3 #{-1, +1}
+
+    ldwio r2, (gp)
+    add r2, r2, r3   #increment LED's 
+    stwio r2, (gp)
+    
+
+NotIRQ1:
+    andi r2, et, 0b001 #check if irq0
+    beq r2, r0, NotIRQ0
+
+NotIRQ0:
+
+ISR_END:
+    ldw r2, 0(sp)
+    ldw r3, 4(sp) #restore r3 and r2 
+    addi sp, sp, 8 #restore stack 
+    eret
+
+.text 
+main: 
+    stw r0, Counter(r0) 
+    movi r2, 3         #both button 0 and 1 generate interrupts 0b11 = 3
+    stwio r2, 0x58(gp) #Send 0b11 to interrupt mask register
+
+    movi r2, 0b10      #enable IRQ1 for botton 
+    wrctl ienable, r2 
+    movi r2, 1
+    wrctl status, r2   #set PIE bit 
+
+
+loop:
+    ldwio r2, 0x40(gp)  #load the value of the switches
+    movi r11, 1
+    movi r12, 2
+    movi r13, 4
+    andi r8, r2, 0b1
+    andi r9, r2, 0b10
+    andi r10, r2, 0b100
+    
+    beq r10, r13, reset #if the "reset" switch is active, jump to the function to reset the timer
+    beq r9, r12, loop_no_display #if the "no display" switch is active, begin running the timer in the no_display loop
+    beq r8, r11, loop_no_clock #if the "stop clock" switch is active, begin running the timer in the no_clock loop
+
+    call delay10ms 
+    ldw r4, Counter(r0) #load the variable which stores the value of the timer
+    addi r4, r4, 1   #add 10 milliseconds to the counter
+    stw r4, Counter(r0) #store this new incremented value
+    call showNum #display this new incremented counter value on the seven segement display
+    br loop
+
+loop_no_display:
+    ldwio r2, 0x40(gp) #load the value of the switches
+    movi r11, 1
+    movi r12, 2
+    movi r13, 4
+    andi r8, r2, 0b1
+    andi r9, r2, 0b10
+    andi r10, r2, 0b100
+    
+    call delay10ms
+    ldw r4, Counter(r0)
+    addi r4, r4, 1
+    stw r4, Counter(r0)
+    
+    beq r10, r13, reset
+    beq r9, r0, loop
+    beq r8, r11, loop_no_clock 
+    br loop_no_display
+
+loop_no_clock:
+
+    ldwio r2, 0x40(gp)  #load the value of the switches
+    movi r11, 1
+    movi r12, 2
+    movi r13, 4
+    andi r8, r2, 0b1
+    andi r9, r2, 0b10
+    andi r10, r2, 0b100
+    
+    beq r10, r13, reset
+    beq r9, r12, loop_no_display
+    beq r8, r0, loop
+    br loop_no_clock
+
+
+reset:
+    stw r0, Counter(r0)
+    ldw r4, Lap(r0)
+    addi r4, r4, 1     
+    stw r4, Lap(r0)
+    call printNum
+    br loop
+
+delay10ms:
+    movia r2, 25000 # 100MHz / 100Hz = 1M clocks
+delay10ms_loop:
+    subi r2, r2, 1 # 1 clock
+    bne r2, r0, delay10ms_loop #2 clocks
+    ret
+
+
+#void showNum(int n) -- convert to 7-seg bits
+showNum:
+    subi sp, sp, 4 
+    stw ra, (sp) 
+    
+    call num2bits
+    stwio r2, O_7SEG_LO(gp)
+    mov r4, r3
+    call num2bits
+    stwio r2, O_7SEG_HI(gp)
+    
+    ldw ra, (sp)
+    addi sp, sp, 4
+    ret
+
+#convert n to seven seg bits
+#bits returned in r2; final quotient returned in r3
+num2bits:
+    movi r2, 0 #Accumulate bits in r2, ready to return
+    movi r10, 10 #store 10 for dividing
+    movi r7, 4 #loop counter i
+n2b_loop:   #do{
+    divu r3, r4, r10
+    mul r5, r3, r10
+    sub r5, r4, r5
+    ldbu r6, Bits7seg(r5)
+    or r2, r2, r6
+    rori r2, r2, 8 #using the rori macro
+    mov r4, r3
+    subi r7, r7, 1
+    bgt r7, r0, n2b_loop 
+    ret
+    
+#void putchar(char c)
+putchar:
+    ldwio r2, O_UART_CTRL(gp)
+    srli r2, r2, 16
+    beq r2, r0, putchar
+    stwio r4, O_UART_DATA(gp)
+    ret
+
+printNum:
+    subi sp, sp, 8
+    stw ra, 4(sp)
+    bge r4, r0, not_neg
+    sub r4, r0, r4
+    stw r4, 0(sp)
+    movi r4, '-'
+    call putchar
+    ldw r4, 0(sp)
+not_neg:
+    movi r10, 10 #if(n <10)
+    bge r4, r10, not_base
+    addi r4, r4, '0'  #putchar('0' + n);
+    call putchar
+    br printNum_done
+    
+not_base:
+    movi r10, 10
+    div r3, r4, r10  #r3 = n /10;
+    mul r5, r3, r10
+    sub r5, r4, r5  #r5 = n % 10;
+    stw r5, 0(sp)
+    mov r4, r3
+    call printNum    #printNum(n/10);
+    ldw r5, 0(sp)
+    addi r4, r5, '0'
+    call putchar   #putchar('0' + (n % 10));
+    
+printNum_done: 
+    ldw ra, 4(sp)
+    addi sp, sp, 8
+    ret 
+    
+
+.data 
+
+Bits7seg:
+    #        0.   1.     2.    3.   4.    5.    6.    7.    8.    9
+    .byte  0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x67
+    .byte  0x77, 0x7c, 0x39, 0x5E, 0x79, 0x71
+    #       A.    B      C.    D.   E.    F
+    
+Counter: .word 0 #Timer1 State variable 
+Lap: .word 0 #lap state variable 
+.end
